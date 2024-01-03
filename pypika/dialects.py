@@ -371,6 +371,88 @@ class OracleQueryBuilder(QueryBuilder):
         return super().get_sql(*args, **kwargs)
 
 
+class PostgresqlLikeReturning:
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._returns = []
+        self._return_star = False
+
+    def __copy__(self) -> "PostgresqlLikeReturning":
+        newone = self.__class__()
+        newone._returns = copy(self._returns)
+        newone._return_star = self._return_star
+        return newone
+
+    def __bool__(self) -> bool:
+        return bool(self._returns)
+
+    def add_terms(self, builder: QueryBuilder,  *terms: Any):
+        for term in terms:
+            if isinstance(term, Field):
+                self._return_field(builder, term)
+            elif isinstance(term, str):
+                self._return_field_str(builder, term)
+            elif isinstance(term, (Function, ArithmeticExpression)):
+                if term.is_aggregate:
+                    raise QueryException("Aggregate functions are not allowed in returning")
+                self._return_other(builder, term)
+            else:
+                self._return_other(builder, builder.wrap_constant(term, builder._wrapper_cls))
+
+    def _validate_returning_term(self, builder: QueryBuilder, term: Term) -> None:
+        for field in term.fields_():
+            if not any([builder._insert_table, builder._update_table, builder._delete_from]):
+                raise QueryException("Returning can't be used in this query")
+
+            table_is_insert_or_update_table = field.table in {builder._insert_table, builder._update_table}
+            join_tables = set(itertools.chain.from_iterable([j.criterion.tables_ for j in builder._joins]))
+            join_and_base_tables = set(builder._from) | join_tables
+            table_not_base_or_join = bool(term.tables_ - join_and_base_tables)
+            if not table_is_insert_or_update_table and table_not_base_or_join:
+                raise QueryException("You can't return from other tables")
+
+    def _set_returns_for_star(self) -> None:
+        self._returns = [returning for returning in self._returns if not hasattr(returning, "table")]
+        self._return_star = True
+
+    def _return_field(self, builder: QueryBuilder, term: Union[str, Field]) -> None:
+        if self._return_star:
+            # Do not add select terms after a star is selected
+            return
+
+        self._validate_returning_term(builder, term)
+
+        if isinstance(term, Star):
+            self._set_returns_for_star()
+
+        self._returns.append(term)
+
+    def _return_field_str(self, builder: QueryBuilder, term: Union[str, Field]) -> None:
+        if term == "*":
+            self._set_returns_for_star()
+            self._returns.append(Star())
+            return
+
+        if builder._insert_table:
+            self._return_field(builder, Field(term, table=builder._insert_table))
+        elif builder._update_table:
+            self._return_field(builder, Field(term, table=builder._update_table))
+        elif builder._delete_from:
+            self._return_field(builder, Field(term, table=builder._from[0]))
+        else:
+            raise QueryException("Returning can't be used in this query")
+
+    def _return_other(self, builder: QueryBuilder, function: Term) -> None:
+        self._validate_returning_term(builder, function)
+        self._returns.append(function)
+
+    def get_sql(self, **kwargs: Any) -> str:
+        return " RETURNING {returning}".format(
+            returning=",".join(term.get_sql(with_alias=True, **kwargs) for term in self._returns),
+        )
+
+
+
 class PostgreSQLQuery(Query):
     """
     Defines a query class for use with PostgreSQL.
@@ -387,9 +469,7 @@ class PostgreSQLQueryBuilder(QueryBuilder):
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(dialect=Dialects.POSTGRESQL, **kwargs)
-        self._returns = []
-        self._return_star = False
-
+        self._returning = PostgresqlLikeReturning()
         self._on_conflict = False
         self._on_conflict_fields = []
         self._on_conflict_do_nothing = False
@@ -405,7 +485,7 @@ class PostgreSQLQueryBuilder(QueryBuilder):
 
     def __copy__(self) -> "PostgreSQLQueryBuilder":
         newone = super().__copy__()
-        newone._returns = copy(self._returns)
+        newone._returning = copy(self._returning)
         newone._on_conflict_do_updates = copy(self._on_conflict_do_updates)
         return newone
 
@@ -568,69 +648,7 @@ class PostgreSQLQueryBuilder(QueryBuilder):
 
     @builder
     def returning(self, *terms: Any) -> "PostgreSQLQueryBuilder":
-        for term in terms:
-            if isinstance(term, Field):
-                self._return_field(term)
-            elif isinstance(term, str):
-                self._return_field_str(term)
-            elif isinstance(term, (Function, ArithmeticExpression)):
-                if term.is_aggregate:
-                    raise QueryException("Aggregate functions are not allowed in returning")
-                self._return_other(term)
-            else:
-                self._return_other(self.wrap_constant(term, self._wrapper_cls))
-
-    def _validate_returning_term(self, term: Term) -> None:
-        for field in term.fields_():
-            if not any([self._insert_table, self._update_table, self._delete_from]):
-                raise QueryException("Returning can't be used in this query")
-
-            table_is_insert_or_update_table = field.table in {self._insert_table, self._update_table}
-            join_tables = set(itertools.chain.from_iterable([j.criterion.tables_ for j in self._joins]))
-            join_and_base_tables = set(self._from) | join_tables
-            table_not_base_or_join = bool(term.tables_ - join_and_base_tables)
-            if not table_is_insert_or_update_table and table_not_base_or_join:
-                raise QueryException("You can't return from other tables")
-
-    def _set_returns_for_star(self) -> None:
-        self._returns = [returning for returning in self._returns if not hasattr(returning, "table")]
-        self._return_star = True
-
-    def _return_field(self, term: Union[str, Field]) -> None:
-        if self._return_star:
-            # Do not add select terms after a star is selected
-            return
-
-        self._validate_returning_term(term)
-
-        if isinstance(term, Star):
-            self._set_returns_for_star()
-
-        self._returns.append(term)
-
-    def _return_field_str(self, term: Union[str, Field]) -> None:
-        if term == "*":
-            self._set_returns_for_star()
-            self._returns.append(Star())
-            return
-
-        if self._insert_table:
-            self._return_field(Field(term, table=self._insert_table))
-        elif self._update_table:
-            self._return_field(Field(term, table=self._update_table))
-        elif self._delete_from:
-            self._return_field(Field(term, table=self._from[0]))
-        else:
-            raise QueryException("Returning can't be used in this query")
-
-    def _return_other(self, function: Term) -> None:
-        self._validate_returning_term(function)
-        self._returns.append(function)
-
-    def _returning_sql(self, **kwargs: Any) -> str:
-        return " RETURNING {returning}".format(
-            returning=",".join(term.get_sql(with_alias=True, **kwargs) for term in self._returns),
-        )
+        self._returning.add_terms(self, *terms)
 
     def get_sql(self, with_alias: bool = False, subquery: bool = False, **kwargs: Any) -> str:
         self._set_kwargs_defaults(kwargs)
@@ -640,9 +658,9 @@ class PostgreSQLQueryBuilder(QueryBuilder):
         querystring += self._on_conflict_sql(**kwargs)
         querystring += self._on_conflict_action_sql(**kwargs)
 
-        if self._returns:
+        if self._returning:
             kwargs['with_namespace'] = self._update_table and self.from_
-            querystring += self._returning_sql(**kwargs)
+            querystring += self._returning.get_sql(**kwargs)
         return querystring
 
 
@@ -872,6 +890,7 @@ class SQLLiteQueryBuilder(QueryBuilder):
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(dialect=Dialects.SQLLITE, wrapper_cls=SQLLiteValueWrapper, **kwargs)
+        self._returning = PostgresqlLikeReturning()
         self._insert_or_replace = False
 
     @builder
@@ -880,6 +899,20 @@ class SQLLiteQueryBuilder(QueryBuilder):
         self._replace = True
         self._insert_or_replace = True
 
+    @builder
+    def returning(self, *terms: Any) -> "SQLLiteQueryBuilder":
+        self._returning.add_terms(self, *terms)
+
     def _replace_sql(self, **kwargs: Any) -> str:
         prefix = "INSERT OR " if self._insert_or_replace else ""
         return prefix + super()._replace_sql(**kwargs)
+
+    def get_sql(self, with_alias: bool = False, subquery: bool = False, **kwargs: Any) -> str:
+        self._set_kwargs_defaults(kwargs)
+
+        querystring = super(SQLLiteQueryBuilder, self).get_sql(with_alias, subquery, **kwargs)
+
+        if self._returning:
+            kwargs['with_namespace'] = self._update_table and self.from_
+            querystring += self._returning.get_sql(**kwargs)
+        return querystring
